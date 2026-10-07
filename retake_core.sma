@@ -1,6 +1,6 @@
 #include <amxmodx>
 #include <reapi>
-#include <xs>
+#include <engine>
 
 #include <retake>
 
@@ -12,6 +12,7 @@
 
 #define TASK_RESPAWN 90000
 #define TASK_PREPARE 70000
+#define TASK_CHECK 70001
 
 // PLUGIN_STATE
 enum 
@@ -35,13 +36,14 @@ enum
 new g_players_state[MAX_PLAYERS + 1];
 
 // ---
-new g_menu_choose;
+new g_menu_choose = -1;
 
 new queue_ingame[MAX_PLAYERS + 2];
 new queue_ingame_size = 0;
 
-new g_is_game_prepare = false;
-new g_task_prepare;
+new bool:g_is_game_prepare;
+new bool:g_round_scored;
+new bool:g_restarting;
 
 // RETAKE GAME MEMBERS AND STATE
 enum
@@ -98,9 +100,14 @@ public plugin_init()
   RegisterHookChain(RG_CBasePlayer_Spawn, "on_player_spawn", true);
 
   RegisterHookChain(RG_CSGameRules_RestartRound, "on_round_restart_pre", false);
+  RegisterHookChain(RG_CSGameRules_RestartRound, "on_round_restart_post", true);
   RegisterHookChain(RG_RoundEnd, "on_round_end_post", true);
 
-  RegisterHookChain(RG_CSGameRules_GetPlayerSpawnSpot, "on_player_spawn_pre", false);
+  register_srvcmd("retake_status", "cmd_retake_status");
+
+  hook_cvar_change(cvar_min_players, "on_limits_changed");
+  hook_cvar_change(cvar_max_players, "on_limits_changed");
+  hook_cvar_change(cvar_plantsite_chooser, "on_limits_changed");
 
   forw_round_start = CreateMultiForward("retake_round_start", ET_IGNORE);
   forw_round_end = CreateMultiForward("retake_round_end", ET_IGNORE);
@@ -113,15 +120,15 @@ public plugin_init()
 
 public plugin_cfg()
 {
-  start_warmup();
   create_menu();
+  start_warmup();
 }
 
 public client_putinserver(id)
 {
-  if (is_user_bot(id) || is_user_hltv(id)) return;
-
   g_players_state[id] = P_NONE;
+  remove_task(TASK_RESPAWN + id);
+  if (is_user_bot(id) || is_user_hltv(id)) return;
 
   set_task(0.25, "task_show_choose_menu", id);
 }
@@ -130,6 +137,7 @@ public client_disconnected(id, bool:drop, message[], maxlen)
 {
   g_players_state[id] = P_NONE;
   remove_task(id);
+  remove_task(TASK_RESPAWN + id);
   queue_remove(id);
 
   check_retake_conditions();
@@ -137,8 +145,10 @@ public client_disconnected(id, bool:drop, message[], maxlen)
 
 start_warmup()
 {
-  g_is_game_prepare = false;
-  g_game_state = GS_WARMUP
+  cancel_prepare();
+  g_game_state = GS_WARMUP;
+  g_round_scored = false;
+  m_plantsite = PLANTSITE_B;
 
   m_round_ct = 0;
   m_round_t = 0;
@@ -150,10 +160,13 @@ start_warmup()
   set_cvar_string("mp_round_infinite", "1");
   set_cvar_float("mp_respawn_immunitytime", 3.0);
   set_cvar_num("mp_forcerespawn", 1);
+  set_cvar_num("mp_autoteambalance", 0);
 
   server_cmd("sv_restartround 1"); // Применяем
 
   client_print_color(0, print_team_blue , "^4[RETAKE] ^1Warmup started!");
+  remove_task(TASK_CHECK);
+  set_task(1.5, "task_check_conditions", TASK_CHECK);
 }
 
 prepare_retake()
@@ -162,41 +175,31 @@ prepare_retake()
 
   g_is_game_prepare = true;
   
-  new time = get_pcvar_num(cvar_prepare_time);
+  new time = clamp(get_pcvar_num(cvar_prepare_time), 1, 300);
 
   client_print_color(0, print_team_blue , "^4[RETAKE] ^1Retake will start in ^4%d s", time);
 
-  // g_task_prepare = TASK_PREPARE + time;
+  remove_task(TASK_PREPARE);
   set_task(float(time), "task_prepare", TASK_PREPARE);
 }
 
 cancel_prepare()
 {
-  if (!g_is_game_prepare) return;
   g_is_game_prepare = false;
-
-  remove_task(g_task_prepare);
+  remove_task(TASK_PREPARE);
 }
 
-public task_prepare(big_time)
+public task_prepare()
 {
   if (!g_is_game_prepare) return;
   if (g_game_state != GS_WARMUP) return;
 
+  if (!can_start_retake())
+  {
+    cancel_prepare();
+    return;
+  }
   start_retake();
-
-  // new time = big_time - TASK_PREPARE - 5;
-
-  // if (time <= 0 && g_is_game_prepare && g_game_state == GS_WARMUP)
-  // {
-  //   start_retake();
-  // }
-  // else if (g_is_game_prepare)
-  // {
-  //   client_print_color(0, print_team_blue , "^4[RETAKE] ^1Retake will start in ^4%d s", time);
-  //   g_task_prepare = TASK_PREPARE + time;
-  //   set_task(5.0, "task_prepare", g_task_prepare);
-  // }
 }
 
 start_retake()
@@ -209,10 +212,10 @@ start_retake()
     remove_task(TASK_RESPAWN + i);
   }
 
-  new Float:seconds = float(get_pcvar_num(cvar_roundtime));
+  new Float:seconds = float(clamp(get_pcvar_num(cvar_roundtime), 1, 3600));
 
   set_cvar_float("mp_roundtime", seconds / 60.0);
-  set_cvar_num("mp_freezetime", get_pcvar_num(cvar_freezetime));
+  set_cvar_num("mp_freezetime", clamp(get_pcvar_num(cvar_freezetime), 0, 60));
   set_cvar_num("mp_buytime", 0);
   set_cvar_num("mp_startmoney", 0);
   set_cvar_string("mp_round_infinite", "0");
@@ -230,8 +233,6 @@ create_menu()
 
   menu_additem(g_menu_choose, "Join game", "1");
   menu_additem(g_menu_choose, "Spectator mode", "2");
-
-  log_amx("MENU ID: %d", g_menu_choose);
 
   menu_setprop(g_menu_choose, MPROP_EXIT, MEXIT_NEVER);
 }
@@ -263,13 +264,16 @@ public choose_menu_handler(player_id, menu_id, item_id)
 
 join_choosed(player_id)
 {
+  if (!is_user_connected(player_id)) return;
   if (g_players_state[player_id] == P_INGAME || g_players_state[player_id] == P_QUEUE) return;
 
-  if (get_ingame_players() >= get_pcvar_num(cvar_max_players))
+  if (g_game_state == GS_RETAKE || get_ingame_players() >= get_player_limit())
   {
+    move_to_spectator(player_id);
     g_players_state[player_id] = P_QUEUE;
     queue_push(player_id);
-
+    client_print_color(player_id, print_team_default,
+      "^4[RETAKE] ^1Queued: %d. Waiting for a free place at round start.", queue_ingame_size);
     return;
   }
 
@@ -280,7 +284,7 @@ join_choosed(player_id)
 
 public init_player(player_id)
 {
-  if (player_id < 0 || player_id > MAX_PLAYERS) return;
+  if (player_id < 1 || player_id > MAX_PLAYERS) return;
   if (!is_user_connected(player_id)) return;
 
   g_players_state[player_id] = P_INGAME;
@@ -291,15 +295,17 @@ public init_player(player_id)
   rg_set_user_team(player_id, choose_player_team());
 
   set_member(player_id, m_iMenu, Menu_OFF); 
-  set_member(player_id, m_iJoiningState, GETINTOGAME);
+  set_member(player_id, m_iJoiningState, JOINED);
   
-  set_task(0.5, "respawn_player", TASK_RESPAWN + player_id);
+  remove_task(TASK_RESPAWN + player_id);
+  if (g_game_state == GS_WARMUP)
+    set_task(0.5, "respawn_player", TASK_RESPAWN + player_id);
 }
 
-choose_player_team()
+TeamName:choose_player_team()
 {
-  new num_t = get_member_game(m_iNumTerrorist);
-  new num_ct = get_member_game(m_iNumCT);
+  new num_t = count_team(TEAM_TERRORIST);
+  new num_ct = count_team(TEAM_CT);
 
   if (num_ct <= num_t) 
   {
@@ -311,9 +317,13 @@ choose_player_team()
   }
 }
 
-public respawn_player(player_id)
+public respawn_player(task_id)
 {
+  new player_id = task_id - TASK_RESPAWN;
+  if (player_id < 1 || player_id > MAX_PLAYERS) return;
   if (!is_user_connected(player_id)) return;
+  if (g_game_state != GS_WARMUP || g_players_state[player_id] != P_INGAME) return;
+  if (is_user_alive(player_id)) return;
 
   rg_round_respawn(player_id);
 }
@@ -322,6 +332,9 @@ public respawn_player(player_id)
 
 queue_push(player_id)
 {
+  if (queue_ingame_size >= MAX_PLAYERS) return;
+  for (new i; i < queue_ingame_size; i++)
+    if (queue_ingame[i] == player_id) return;
   queue_ingame[queue_ingame_size] = player_id;
   queue_ingame_size++;
 }
@@ -332,12 +345,12 @@ queue_pop()
 
   new ret_id = queue_ingame[0];
 
-  for (new i = 0; i < queue_ingame_size; i++)
+  for (new i = 0; i < queue_ingame_size - 1; i++)
   {
     queue_ingame[i] = queue_ingame[i+1];
   }
 
-  queue_ingame_size--;
+  queue_ingame[--queue_ingame_size] = 0;
 
   return ret_id;
 }
@@ -356,12 +369,12 @@ queue_remove(player_id)
 
   if (index == -1) return;
 
-  for (new i = index; i < queue_ingame_size; i++)
+  for (new i = index; i < queue_ingame_size - 1; i++)
   {
     queue_ingame[i] = queue_ingame[i+1];
   }
 
-  queue_ingame_size--;
+  queue_ingame[--queue_ingame_size] = 0;
 }
 
 // queue_contain(player_id)
@@ -379,9 +392,9 @@ queue_remove(player_id)
 get_ingame_players()
 {
   new counter = 0;
-  for (new i = 0; i <= MAX_PLAYERS; i++)
+  for (new i = 1; i <= MAX_PLAYERS; i++)
   {
-    if (g_players_state[i] == P_INGAME) counter++;
+    if (is_user_connected(i) && g_players_state[i] == P_INGAME) counter++;
   }
 
   return counter;
@@ -389,10 +402,10 @@ get_ingame_players()
 
 check_retake_conditions()
 {
-  new counter = get_ingame_players();
+  if (g_game_state == GS_NONE) return;
+  if (g_game_state == GS_WARMUP) fill_free_places();
 
-  // Проверяем на минимум сначала
-  if(counter >= get_pcvar_num(cvar_min_players))
+  if (can_start_retake())
   {
     if(g_game_state == GS_WARMUP)
     {
@@ -408,18 +421,6 @@ check_retake_conditions()
     }
   }
 
-  // Проверяем на максимум. Запускаем по одному
-  if(counter < get_pcvar_num(cvar_max_players))
-  {
-    new new_player_id = queue_pop();
-
-    if (new_player_id == -1) return;
-
-    init_player(new_player_id);
-
-    check_retake_conditions();
-  }
-
 }
 
 spectate_choosed(player_id)
@@ -432,11 +433,7 @@ spectate_choosed(player_id)
   }
 
   g_players_state[player_id] = P_SPECTATE;
-
-  if (is_user_alive(player_id))
-    user_kill(player_id, 1);
-
-  rg_set_user_team(player_id, TEAM_SPECTATOR);
+  move_to_spectator(player_id);
 
   check_retake_conditions();
 }
@@ -460,18 +457,36 @@ public force_retake_menu(id)
 
 public on_player_spawn(player_id)
 {
+  if (!is_user_alive(player_id)) return;
   if (g_game_state == GS_WARMUP) {
     set_member(player_id, m_iAccount, 16000);
     return;
   }
+  if (g_game_state == GS_RETAKE && g_players_state[player_id] == P_INGAME)
+    place_retake_player(player_id);
 }
 
 public on_round_restart_pre()
 {
   if (g_game_state != GS_RETAKE) return;
 
+  g_restarting = true;
+  fill_free_places();
+  if (!can_start_retake())
+  {
+    start_warmup();
+    return;
+  }
+  balance_players();
   choose_plantsite();
+  retake_map_reset_spawns();
+  g_round_scored = false;
+}
 
+public on_round_restart_post()
+{
+  g_restarting = false;
+  if (g_game_state != GS_RETAKE) return;
   ExecuteForward(forw_round_start);
 
   new rounds_num = m_round_t + m_round_ct + 1;
@@ -480,7 +495,7 @@ public on_round_restart_pre()
 
 choose_plantsite()
 {
-  new chooser = get_pcvar_num(cvar_plantsite_chooser);
+  new chooser = clamp(get_pcvar_num(cvar_plantsite_chooser), 0, 3);
 
   if (chooser == 0) // через один
   {
@@ -503,14 +518,11 @@ choose_plantsite()
   }
 }
 
-public on_player_spawn_pre(player_id)
+place_retake_player(player_id)
 {
-  if (g_game_state != GS_RETAKE) return HC_CONTINUE;
-  if (g_players_state[player_id] != P_INGAME) return HC_CONTINUE; // А по хорошему узнать почему он спавнится
+  new TeamName:player_team = get_member(player_id, m_iTeam);
 
-  new player_team = get_user_team(player_id);
-
-  if (player_team == -1) return HC_CONTINUE;
+  if (player_team != TEAM_TERRORIST && player_team != TEAM_CT) return;
 
   new slot;
 
@@ -530,45 +542,162 @@ public on_player_spawn_pre(player_id)
 
   if (!retake_map_get_spawn(slot, new_origin, new_angles))
   {
-    log_amx("retake spawns not found");
-    return HC_CONTINUE; 
+    log_amx("[Retake] No unused spawn for slot %d; returning to warmup.", slot);
+    start_warmup();
+    return;
   }
 
-  set_entvar(player_id, var_origin, new_origin);
+  entity_set_origin(player_id, new_origin);
 
   set_entvar(player_id, var_angles, new_angles);
   set_entvar(player_id, var_v_angle, new_angles);
-  set_entvar(player_id, var_fixangle, 1.0);
+  set_entvar(player_id, var_fixangle, 1);
 
   new Float:zero[3] = {0.0, 0.0, 0.0}; 
   set_entvar(player_id, var_velocity, zero);
   set_entvar(player_id, var_basevelocity, zero);
 
-  log_amx("spawn: %f, %f, %f", new_origin[0], new_origin[1], new_origin[2]);
-
-  SetHookChainReturn(ATYPE_INTEGER, 1); 
-  return HC_BREAK;
 }
 
-public on_round_end_post(status, event, delay)
+public on_round_end_post(WinStatus:status, ScenarioEventEndRound:event, Float:delay)
 {
-  if (g_game_state != GS_RETAKE) return;
+  if (g_game_state != GS_RETAKE || g_restarting || g_round_scored) return;
+  // Other plugins may reject RG_RoundEnd; count only an accepted round result.
+  if (!GetHookChainReturn(ATYPE_BOOL)) return;
+  if (status != WINSTATUS_TERRORISTS && status != WINSTATUS_CTS) return;
+  g_round_scored = true;
 
   if (status == WINSTATUS_TERRORISTS) m_round_t++;
   if (status == WINSTATUS_CTS) m_round_ct++;
 
   ExecuteForward(forw_round_end);
 
-  if (m_round_t >= get_pcvar_num(cvar_win_round))
+  if (m_round_t >= clamp(get_pcvar_num(cvar_win_round), 1, 1000))
   {
     client_print_color(0, print_team_red , "^4[RETAKE] ^3Terrorists ^1win! | CT %d : %d T", m_round_ct, m_round_t);
 
     start_warmup();
   }
-  else if (m_round_ct >= get_pcvar_num(cvar_win_round))
+  else if (m_round_ct >= clamp(get_pcvar_num(cvar_win_round), 1, 1000))
   {
     client_print_color(0, print_team_blue , "^4[RETAKE] ^3Counter-Terrorists ^1win! | CT %d : %d T", m_round_ct, m_round_t );
 
     start_warmup();
   }
+}
+
+count_team(TeamName:team)
+{
+  new count;
+  for (new id = 1; id <= MAX_PLAYERS; id++)
+    if (is_user_connected(id) && g_players_state[id] == P_INGAME &&
+        get_member(id, m_iTeam) == team) count++;
+  return count;
+}
+
+get_player_limit()
+{
+  new limit = clamp(get_pcvar_num(cvar_max_players), 2, MAX_PLAYERS);
+  if (!retake_map_has_config()) return limit;
+  new chooser = clamp(get_pcvar_num(cvar_plantsite_chooser), 0, 3);
+  new t = retake_map_spawn_count(SPAWN_T_A);
+  new ct = retake_map_spawn_count(SPAWN_CT_A);
+  if (chooser == 3)
+  {
+    t = retake_map_spawn_count(SPAWN_T_B);
+    ct = retake_map_spawn_count(SPAWN_CT_B);
+  }
+  else if (chooser != 2)
+  {
+    t = min(t, retake_map_spawn_count(SPAWN_T_B));
+    ct = min(ct, retake_map_spawn_count(SPAWN_CT_B));
+  }
+  return min(limit, min(t * 2 + 1, ct * 2));
+}
+
+bool:can_start_retake()
+{
+  new count = get_ingame_players();
+  return retake_map_has_config() &&
+    count >= clamp(get_pcvar_num(cvar_min_players), 2, MAX_PLAYERS) &&
+    count <= get_player_limit();
+}
+
+fill_free_places()
+{
+  new limit = get_player_limit();
+  // A smaller map/config may have fewer places than the previous warmup.
+  for (new id = MAX_PLAYERS; id >= 1 && get_ingame_players() > limit; id--)
+  {
+    if (!is_user_connected(id) || g_players_state[id] != P_INGAME) continue;
+    g_players_state[id] = P_QUEUE;
+    move_to_spectator(id);
+    queue_push(id);
+  }
+  while (queue_ingame_size > 0 && get_ingame_players() < limit)
+  {
+    new id = queue_pop();
+    if (id < 1 || id > MAX_PLAYERS || !is_user_connected(id)) continue;
+    if (g_players_state[id] != P_QUEUE) continue;
+    init_player(id);
+  }
+}
+
+balance_players()
+{
+  new desired_ct = (get_ingame_players() + 1) / 2;
+  new num_ct = count_team(TEAM_CT);
+  for (new id = 1; id <= MAX_PLAYERS && num_ct != desired_ct; id++)
+  {
+    if (!is_user_connected(id) || g_players_state[id] != P_INGAME) continue;
+    new TeamName:team = get_member(id, m_iTeam);
+    if (num_ct < desired_ct && team == TEAM_TERRORIST)
+    {
+      rg_set_user_team(id, TEAM_CT);
+      num_ct++;
+    }
+    else if (num_ct > desired_ct && team == TEAM_CT)
+    {
+      rg_set_user_team(id, TEAM_TERRORIST);
+      num_ct--;
+    }
+  }
+}
+
+move_to_spectator(id)
+{
+  remove_task(TASK_RESPAWN + id);
+  if (is_user_alive(id)) user_kill(id, 1);
+  rg_set_user_team(id, TEAM_SPECTATOR);
+  set_member(id, m_iMenu, Menu_OFF);
+  set_member(id, m_iJoiningState, JOINED);
+}
+
+public task_check_conditions()
+{
+  check_retake_conditions();
+}
+
+public retake_map_loaded()
+{
+  if (g_game_state == GS_NONE) return;
+  if (g_game_state == GS_RETAKE) start_warmup();
+  else check_retake_conditions();
+}
+
+public on_limits_changed(pcvar, const old_value[], const new_value[])
+{
+  if (g_game_state == GS_NONE) return;
+  cancel_prepare();
+  remove_task(TASK_CHECK);
+  set_task(0.1, "task_check_conditions", TASK_CHECK);
+}
+
+public cmd_retake_status()
+{
+  server_print("[Retake] state=%d players=%d queued=%d minimum=%d capacity=%d config=%d preparing=%d",
+    g_game_state, get_ingame_players(), queue_ingame_size,
+    clamp(get_pcvar_num(cvar_min_players), 2, MAX_PLAYERS), get_player_limit(),
+    retake_map_has_config(), g_is_game_prepare);
+  return PLUGIN_HANDLED;
 }
