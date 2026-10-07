@@ -2,36 +2,28 @@
 #include <amxmisc>
 #include <reapi>
 #include <engine>
-#include <string>
 
 #include <retake>
-
-// Требуется AMX Mod X 1.10+
+#include <retake_config>
 
 #define PLUGIN_NAME "Retake Map"
 #define PLUGIN_VERSION "0.1"
 #define PLUGIN_AUTHOR "Asura"
 
-new g_has_map_cfg = false;
-
-// ARRAYS FOR WALLS AND SPAWNS
-#define MAX_SPAWNS 32
-
-new Float:arr_spawn[SPAWN_SLOTS][MAX_SPAWNS][6];
+new bool:g_has_map_cfg;
+new Float:arr_spawn[SPAWN_SLOTS][RT_MAX_SPAWNS][6];
 new arr_spawn_count[SPAWN_SLOTS];
-
-#define MAX_WALLS 64
-
-new Float:arr_wall[MAX_WALLS][3];
-new arr_wallname[MAX_WALLS][64];
-new Float:arr_wallsize[MAX_WALLS];
-new arr_wallent[MAX_WALLS];
-new arr_wall_count = 0;
-
-// FORWARDS
+new bool:g_spawn_used[SPAWN_SLOTS][RT_MAX_SPAWNS];
+new arr_wallent[RT_MAX_WALLS];
+new arr_wall_count;
 new forw_map_cfg_loaded;
 
 new const WALL_MODEL[] = "models/box.mdl";
+new const WALL_CLASSNAME[] = "retake_map_wall";
+new const SPAWN_SECTIONS[SPAWN_SLOTS][] = {
+  "spawns_t_a", "spawns_t_b", "spawns_ct_a", "spawns_ct_b"
+};
+
 public plugin_precache()
 {
   precache_model(WALL_MODEL);
@@ -40,7 +32,7 @@ public plugin_precache()
 public plugin_init()
 {
   register_plugin(PLUGIN_NAME, PLUGIN_VERSION, PLUGIN_AUTHOR);
-
+  register_srvcmd("retake_map_status", "cmd_map_status");
   forw_map_cfg_loaded = CreateMultiForward("retake_map_loaded", ET_IGNORE);
 }
 
@@ -48,6 +40,8 @@ public plugin_natives()
 {
   register_native("retake_map_has_config", "RTM_has_config");
   register_native("retake_map_get_spawn", "RTM_get_spawn");
+  register_native("retake_map_spawn_count", "RTM_spawn_count");
+  register_native("retake_map_reset_spawns", "RTM_reset_spawns");
 }
 
 public plugin_cfg()
@@ -55,333 +49,320 @@ public plugin_cfg()
   load_config();
 }
 
+public plugin_end()
+{
+  for (new i; i < arr_wall_count; i++) remove_owned_wall(arr_wallent[i]);
+  DestroyForward(forw_map_cfg_loaded);
+}
+
 public retake_config_saved()
 {
   load_config();
 }
 
-map_cfg_loaded()
-{
-  ExecuteForward(forw_map_cfg_loaded);
-}
-
-// -------
-// Natives
-// -------
 public RTM_has_config()
 {
   return g_has_map_cfg;
 }
 
-// public RTM_get_spawn(slot, Float:origin[], Float:angles[])
-// {
-//   log_amx("retake map: slot %d, count %d", slot, arr_spawn_count);
-//   if (slot < 0 || slot >= SPAWN_SLOTS) return 0;
-//   if (arr_spawn_count[slot] == 0) return 0;
+public RTM_spawn_count(plugin_id, num_params)
+{
+  if (num_params != 1) return 0;
+  new slot = get_param(1);
+  if (slot < 0 || slot >= SPAWN_SLOTS) return 0;
+  return arr_spawn_count[slot];
+}
 
-//   new index = random(arr_spawn_count[slot]); // from 0
-
-//   set_float_byref(origin[0], arr_spawn[slot][index][0]);
-//   set_float_byref(origin[1], arr_spawn[slot][index][1]);
-//   set_float_byref(origin[2], arr_spawn[slot][index][2] + 2.0); 
-
-//   set_float_byref(angles[0], arr_spawn[slot][index][3]);
-//   set_float_byref(angles[1], arr_spawn[slot][index][4]);
-//   set_float_byref(angles[2], arr_spawn[slot][index][5]);
-
-//   return 1;
-// }
+public RTM_reset_spawns()
+{
+  for (new slot; slot < SPAWN_SLOTS; slot++)
+    for (new i; i < RT_MAX_SPAWNS; i++) g_spawn_used[slot][i] = false;
+  return 1;
+}
 
 public RTM_get_spawn(plugin_id, num_params)
 {
-  new slot = get_param(1); 
+  if (num_params != 3) return 0;
+  new slot = get_param(1);
+  if (slot < 0 || slot >= SPAWN_SLOTS || !g_has_map_cfg) return 0;
 
-  log_amx("retake map: slot %d, count %d", slot, arr_spawn_count[slot]);
+  new available[RT_MAX_SPAWNS], count;
+  for (new i; i < arr_spawn_count[slot]; i++)
+    if (!g_spawn_used[slot][i]) available[count++] = i;
+  if (!count) return 0;
 
-  if (slot < 0 || slot >= SPAWN_SLOTS) return 0;
-  if (arr_spawn_count[slot] == 0) return 0;
-
-  new index = random(arr_spawn_count[slot]); // Выбираем случайный спавн
-
-  new Float:output_origin[3];
-  new Float:output_angles[3];
-
-  output_origin[0] = arr_spawn[slot][index][0];
-  output_origin[1] = arr_spawn[slot][index][1];
-  output_origin[2] = arr_spawn[slot][index][2];
-
-  output_angles[0] = arr_spawn[slot][index][3];
-  output_angles[1] = arr_spawn[slot][index][4];
-  output_angles[2] = arr_spawn[slot][index][5];
-
-  set_array_f(2, output_origin, 3);
-  set_array_f(3, output_angles, 3);
-
+  new index = available[random(count)];
+  new Float:origin[3], Float:angles[3];
+  for (new axis; axis < 3; axis++)
+  {
+    origin[axis] = arr_spawn[slot][index][axis];
+    angles[axis] = arr_spawn[slot][index][axis + 3];
+  }
+  set_array_f(2, origin, sizeof(origin));
+  set_array_f(3, angles, sizeof(angles));
+  g_spawn_used[slot][index] = true;
   return 1;
+}
+
+public cmd_map_status()
+{
+  server_print("[Retake Map] Ready=%d, walls=%d", g_has_map_cfg, arr_wall_count);
+  for (new slot; slot < SPAWN_SLOTS; slot++)
+  {
+    new used;
+    for (new i; i < arr_spawn_count[slot]; i++)
+      if (g_spawn_used[slot][i]) used++;
+    server_print("[Retake Map] %s: total=%d, remaining=%d", SPAWN_SECTIONS[slot],
+      arr_spawn_count[slot], arr_spawn_count[slot] - used);
+  }
+  return PLUGIN_HANDLED;
 }
 
 load_config()
 {
-  clear_spawns();
+  // Parse and build a complete replacement before touching the active map.
+  static Float:spawns[SPAWN_SLOTS][RT_MAX_SPAWNS][6];
+  static spawn_count[SPAWN_SLOTS];
+  static Float:walls[RT_MAX_WALLS][4];
+  static wall_names[RT_MAX_WALLS][RT_WALL_NAME_LEN];
+  static wall_entities[RT_MAX_WALLS];
+  arrayset(spawn_count, 0, sizeof(spawn_count));
+  arrayset(wall_entities, 0, sizeof(wall_entities));
+  new wall_count;
 
-  remove_all_walls();
-
-  g_has_map_cfg = false;
-
-  new default_cfg_path[PLATFORM_MAX_PATH];
-  get_config_path(default_cfg_path, charsmax(default_cfg_path));
-
-  if (!file_exists(default_cfg_path))
-  {
-    log_amx("[Retake Map] No config for this map (%s).", default_cfg_path);
-    map_cfg_loaded();
-    return;
-  }
-
-  new file = fopen(default_cfg_path, "r");
+  new path[PLATFORM_MAX_PATH];
+  get_config_path(path, charsmax(path));
+  new file = fopen(path, "r");
   if (!file)
   {
-    log_amx("[Retake Map] Cannot open file for reading: %s", default_cfg_path);
-    map_cfg_loaded();
+    config_rejected(path, 0, "cannot read file; save a complete map configuration first");
     return;
   }
 
-  new line[256];
-  new section[32] = "";
-
+  new line[384], line_number, section = -1, reason[192];
   while (fgets(file, line, charsmax(line)))
   {
-    trim(line);
-    if (line[0] == 0 || line[0] == ';' || line[0] == '#')
+    line_number++;
+    if (strlen(line) == charsmax(line))
     {
-      continue;
+      copy(reason, charsmax(reason), "line is too long; shorten this entry");
+      break;
     }
+    trim(line);
+    if (!line[0] || line[0] == ';' || line[0] == '#') continue;
 
     if (line[0] == '[')
     {
-      new end = strfind(line, "]");
-      if (end == -1)
+      new length = strlen(line);
+      if (line[length - 1] != ']')
       {
-        continue;
+        copy(reason, charsmax(reason), "expected a complete [section] header");
+        break;
       }
-      line[end] = 0;
-      copy(section, charsmax(section), line[1]);
-      trim(section);
+      line[length - 1] = 0;
+      section = -1;
+      for (new slot; slot < SPAWN_SLOTS; slot++)
+        if (equali(line[1], SPAWN_SECTIONS[slot])) section = slot;
+      if (equali(line[1], "walls")) section = SPAWN_SLOTS;
+      if (section == -1)
+      {
+        copy(reason, charsmax(reason), "unknown section; use spawns_t_a, spawns_t_b, spawns_ct_a, spawns_ct_b or walls");
+        break;
+      }
+      continue;
     }
-    else
+
+    new eq = strfind(line, "=");
+    if (section == -1 || eq <= 0)
     {
-        new eq = strfind(line, "=");
-        if (eq == -1)
-        {
-            continue;
-        }
-
-        new key[64], value[128];
-
-        // Берём '=' внутри уже усечённого key, а не в исходной line
-        copy(key, charsmax(key), line);
-        new key_eq = strfind(key, "=");
-        if (key_eq == -1)
-        {
-            continue; // '=' оказался за границей key — пропускаем строку
-        }
-        key[key_eq] = 0;
-        trim(key);
-
-        copy(value, charsmax(value), line[eq + 1]);
-        trim(value);
-
-        if (equali(section, "spawns_t_a"))
-            parse_spawn_line(SPAWN_T_A, value);
-
-        else if (equali(section, "spawns_t_b"))
-            parse_spawn_line(SPAWN_T_B, value);
-
-        else if (equali(section, "spawns_ct_a"))
-            parse_spawn_line(SPAWN_CT_A, value);
-
-        else if (equali(section, "spawns_ct_b"))
-            parse_spawn_line(SPAWN_CT_B, value);
-
-        else if (equali(section, "walls"))
-            parse_wall_line(key, value);
+      copy(reason, charsmax(reason), "expected key = values inside a known section");
+      break;
     }
-  }
-
-  fclose(file);
-
-  for (new i = 0; i < arr_wall_count; i++)
-  {
-    arr_wallent[i] = create_wall_entity(i);
-
-    log_amx("[Retake Map] Wall %d '%s': origin=(%.1f %.1f %.1f) size=%.1f ent=%d",
-      i, arr_wallname[i],
-      arr_wall[i][0], arr_wall[i][1], arr_wall[i][2],
-      arr_wallsize[i], arr_wallent[i]);
-  }
-
-  g_has_map_cfg = true;
-
-  log_amx("[Retake Map] Loaded config: spawns T/A=%d T/B=%d CT/A=%d CT/B=%d, walls=%d",
-    arr_spawn_count[SPAWN_T_A], arr_spawn_count[SPAWN_T_B],
-    arr_spawn_count[SPAWN_CT_A], arr_spawn_count[SPAWN_CT_B],
-    arr_wall_count);
-
-  map_cfg_loaded();
-}
-
-parse_spawn_line(slot, value[])
-{
-  if (arr_spawn_count[slot] >= MAX_SPAWNS)
-  {
-    return;
-  }
-
-  new Float:vals[6];
-  if (parse_floats(value, vals, 6) != 6)
-  {
-    log_amx("[Retake Map] Bad spawn line: '%s'", value);
-    return;
-  }
-
-  new i = arr_spawn_count[slot];
-  for (new j = 0; j < 6; j++)
-  {
-    arr_spawn[slot][i][j] = vals[j];
-  }
-  arr_spawn_count[slot]++;
-}
-
-parse_wall_line(key[], value[])
-{
-  if (arr_wall_count >= MAX_WALLS)
-  {
-    return;
-  }
-
-  new Float:vals[4];
-  if (parse_floats(value, vals, 4) != 4)
-  {
-    log_amx("[Retake Map] Bad wall line: '%s = %s'", key, value);
-    return;
-  }
-
-  new i = arr_wall_count;
-
-  copy(arr_wallname[i], charsmax(arr_wallname[]), key);
-
-  arr_wall[i][0] = vals[0];
-  arr_wall[i][1] = vals[1];
-  arr_wall[i][2] = vals[2];
-
-  arr_wallsize[i] = vals[3];
-  arr_wallent[i] = 0;
-
-  arr_wall_count++;
-}
-
-create_wall_entity(wall_index)
-{
-  new ent = rg_create_entity("func_wall", false);
-
-  if (!ent)
-  {
-    log_amx("[Retake Map] Failed to create func_wall for wall %d", wall_index);
-    return 0;
-  }
-
-  new Float:half = arr_wallsize[wall_index] / 2.0;
-  new Float:mins[3], Float:maxs[3];
-
-  mins[0] = -half;
-  mins[1] = -half;
-  mins[2] = -half;
-  maxs[0] = half;
-  maxs[1] = half;
-  maxs[2] = half;
-
-  entity_set_model(ent, WALL_MODEL);
-
-  DispatchSpawn(ent);
-
-  set_entvar(ent, var_origin, arr_wall[wall_index]);
-  entity_set_size(ent, mins, maxs);
-  set_entvar(ent, var_solid, SOLID_BBOX);
-  set_entvar(ent, var_movetype, MOVETYPE_PUSH);
-
-  set_entvar(ent, var_rendermode, kRenderNormal);
-  set_entvar(ent, var_renderamt, 255.0);
-  
-
-  return ent;
-}
-
-parse_floats(const value[], Float:out[], count)
-{
-  new buffer[256];
-  copy(buffer, charsmax(buffer), value);
-
-  new pos = 0;
-  new parsed = 0;
-  new len = strlen(buffer);
-
-  while (pos < len && parsed < count)
-  {
-    while (pos < len && (buffer[pos] == ' ' || buffer[pos] == 9))
+    if (strlen(line[eq + 1]) >= 256)
     {
-      pos++;
+      copy(reason, charsmax(reason), "value is too long; shorten this entry");
+      break;
     }
-    if (pos >= len)
+    new value[256];
+    copy(value, charsmax(value), line[eq + 1]);
+    line[eq] = 0;
+    trim(line);
+    if (!line[0] || strlen(line) >= RT_WALL_NAME_LEN)
     {
+      copy(reason, charsmax(reason), "key must contain 1..63 characters");
       break;
     }
 
-    new start = pos;
-    while (pos < len && buffer[pos] != ' ' && buffer[pos] != 9)
+    new Float:values[6];
+    if (!rt_parse_floats(value, values, section == SPAWN_SLOTS ? 4 : 6))
     {
-      pos++;
+      copy(reason, charsmax(reason), "expected exactly 6 spawn numbers or 4 wall numbers, each within -32768..32768");
+      break;
     }
 
-    new saved = buffer[pos];
-    buffer[pos] = 0;
-    out[parsed] = str_to_float(buffer[start]);
-    buffer[pos] = saved;
-    parsed++;
+    if (section < SPAWN_SLOTS)
+    {
+      for (new c; line[c]; c++)
+      {
+        if (line[c] < '0' || line[c] > '9')
+        {
+          copy(reason, charsmax(reason), "spawn key must be a non-negative integer");
+          break;
+        }
+      }
+      if (reason[0]) break;
+      if (spawn_count[section] == RT_MAX_SPAWNS)
+      {
+        formatex(reason, charsmax(reason), "%s exceeds the limit of %d spawns", SPAWN_SECTIONS[section], RT_MAX_SPAWNS);
+        break;
+      }
+
+      // Enum slots alternate A/B; reject intersecting standing-player boxes at the same site.
+      for (new other = section % 2; other < SPAWN_SLOTS; other += 2)
+      {
+        for (new i; i < spawn_count[other]; i++)
+        {
+          if (floatabs(values[0] - spawns[other][i][0]) < 32.0 &&
+              floatabs(values[1] - spawns[other][i][1]) < 32.0 &&
+              floatabs(values[2] - spawns[other][i][2]) < 72.0)
+          {
+            formatex(reason, charsmax(reason), "spawn overlaps %s entry %d; separate player boxes by 32 horizontally or 72 vertically", SPAWN_SECTIONS[other], i);
+            break;
+          }
+        }
+        if (reason[0]) break;
+      }
+      if (reason[0]) break;
+      new index = spawn_count[section]++;
+      for (new i; i < 6; i++) spawns[section][index][i] = values[i];
+    }
+    else
+    {
+      if (!rt_valid_wall_name(line))
+      {
+        copy(reason, charsmax(reason), "invalid wall name; remove control characters and INI delimiters");
+        break;
+      }
+      if (wall_count == RT_MAX_WALLS || values[3] < 1.0 || values[3] > 4096.0)
+      {
+        copy(reason, charsmax(reason), "wall limit is 64 and wall size must be within 1..4096");
+        break;
+      }
+      for (new i; i < wall_count; i++)
+      {
+        if (equali(line, wall_names[i]))
+        {
+          copy(reason, charsmax(reason), "duplicate wall name; give every wall a unique name");
+          break;
+        }
+      }
+      if (reason[0]) break;
+      copy(wall_names[wall_count], RT_WALL_NAME_LEN - 1, line);
+      for (new i; i < 4; i++) walls[wall_count][i] = values[i];
+      wall_count++;
+    }
+  }
+  if (!feof(file) && !reason[0])
+    copy(reason, charsmax(reason), "file read failed before end of file");
+  fclose(file);
+
+  if (reason[0])
+  {
+    config_rejected(path, line_number, reason);
+    return;
+  }
+  for (new slot; slot < SPAWN_SLOTS; slot++)
+  {
+    if (!spawn_count[slot])
+    {
+      formatex(reason, charsmax(reason), "section [%s] requires at least one spawn", SPAWN_SECTIONS[slot]);
+      config_rejected(path, 0, reason);
+      return;
+    }
   }
 
-  return parsed;
+  for (new i; i < wall_count; i++)
+  {
+    wall_entities[i] = create_wall_entity(walls[i]);
+    if (!wall_entities[i])
+    {
+      for (new j; j < i; j++) remove_owned_wall(wall_entities[j]);
+      formatex(reason, charsmax(reason), "cannot create wall '%s'; check free entity capacity", wall_names[i]);
+      config_rejected(path, 0, reason);
+      return;
+    }
+  }
+
+  for (new i; i < arr_wall_count; i++) remove_owned_wall(arr_wallent[i]);
+  arr_wall_count = wall_count;
+  for (new i; i < wall_count; i++)
+  {
+    arr_wallent[i] = wall_entities[i];
+    set_entvar(arr_wallent[i], var_solid, SOLID_BBOX);
+    new Float:origin[3];
+    for (new axis; axis < 3; axis++) origin[axis] = walls[i][axis];
+    entity_set_origin(arr_wallent[i], origin);
+  }
+  for (new slot; slot < SPAWN_SLOTS; slot++)
+  {
+    arr_spawn_count[slot] = spawn_count[slot];
+    for (new i; i < spawn_count[slot]; i++)
+      for (new axis; axis < 6; axis++) arr_spawn[slot][i][axis] = spawns[slot][i][axis];
+  }
+  RTM_reset_spawns();
+  g_has_map_cfg = true;
+  log_amx("[Retake Map] Applied %s: T/A=%d T/B=%d CT/A=%d CT/B=%d, walls=%d", path,
+    arr_spawn_count[SPAWN_T_A], arr_spawn_count[SPAWN_T_B],
+    arr_spawn_count[SPAWN_CT_A], arr_spawn_count[SPAWN_CT_B], arr_wall_count);
+  ExecuteForward(forw_map_cfg_loaded);
+}
+
+config_rejected(const path[], line, const reason[])
+{
+  log_amx("[Retake Map] Rejected %s (line %d): %s", path, line, reason);
+  if (g_has_map_cfg) log_amx("[Retake Map] Previous valid configuration remains active.");
+  else log_amx("[Retake Map] Retake unavailable until the configuration is corrected.");
+}
+
+create_wall_entity(const Float:wall[4])
+{
+  new ent = rg_create_entity("func_wall", false);
+  if (ent <= MaxClients || !is_valid_ent(ent)) return 0;
+  entity_set_model(ent, WALL_MODEL);
+  DispatchSpawn(ent);
+  if (!is_valid_ent(ent)) return 0;
+  set_entvar(ent, var_classname, WALL_CLASSNAME);
+  set_entvar(ent, var_solid, SOLID_NOT);
+  set_entvar(ent, var_movetype, MOVETYPE_NONE);
+
+  new Float:half = wall[3] / 2.0;
+  new Float:mins[3], Float:maxs[3], Float:origin[3];
+  for (new axis; axis < 3; axis++)
+  {
+    mins[axis] = -half;
+    maxs[axis] = half;
+    origin[axis] = wall[axis];
+  }
+  entity_set_size(ent, mins, maxs);
+  entity_set_origin(ent, origin);
+  set_entvar(ent, var_rendermode, kRenderNormal);
+  set_entvar(ent, var_renderamt, 255.0);
+  return ent;
+}
+
+remove_owned_wall(ent)
+{
+  if (ent <= MaxClients || !is_valid_ent(ent)) return;
+  new classname[32];
+  entity_get_string(ent, EV_SZ_classname, classname, charsmax(classname));
+  if (equal(classname, WALL_CLASSNAME)) remove_entity(ent);
 }
 
 get_config_path(output[], len)
 {
-  new mapname[32];
+  new mapname[32], configsdir[PLATFORM_MAX_PATH];
   get_mapname(mapname, charsmax(mapname));
   strtolower(mapname);
-
-  new configsdir[PLATFORM_MAX_PATH];
   get_configsdir(configsdir, charsmax(configsdir));
-
   formatex(output, len, "%s/retakes/%s.ini", configsdir, mapname);
-}
-
-remove_all_walls()
-{
-  for (new i = 0; i < arr_wall_count; i++)
-  {
-    if (arr_wallent[i] > 0)
-    {
-      rg_remove_entity(arr_wallent[i]);
-    }
-    arr_wallent[i] = 0;
-  }
-
-  arr_wall_count = 0;
-}
-
-clear_spawns()
-{
-  for (new i = 0; i < SPAWN_SLOTS; i++)
-  {
-    arr_spawn_count[i] = 0;
-  }
 }
