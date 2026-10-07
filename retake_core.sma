@@ -294,8 +294,12 @@ public init_player(player_id)
 
   rg_set_user_team(player_id, choose_player_team());
 
-  set_member(player_id, m_iMenu, Menu_OFF); 
-  set_member(player_id, m_iJoiningState, JOINED);
+  set_member(player_id, m_iMenu, Menu_OFF);
+  // PlayerSpawn skips the initial equipment while m_bJustConnected is true.
+  // A queued first join is spawned by RestartRound, without GetIntoGame.
+  set_member(player_id, m_bJustConnected, false);
+  set_member(player_id, m_bNotKilled, false);
+  set_member(player_id, m_iJoiningState, g_game_state == GS_WARMUP ? GETINTOGAME : JOINED);
   
   remove_task(TASK_RESPAWN + player_id);
   if (g_game_state == GS_WARMUP)
@@ -458,6 +462,9 @@ public force_retake_menu(id)
 public on_player_spawn(player_id)
 {
   if (!is_user_alive(player_id)) return;
+  // A warmup restart can spawn the player before the next JoiningThink.
+  if (g_players_state[player_id] == P_INGAME)
+    set_member(player_id, m_iJoiningState, JOINED);
   if (g_game_state == GS_WARMUP) {
     set_member(player_id, m_iAccount, 16000);
     return;
